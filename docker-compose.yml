@@ -1,0 +1,8 @@
+services:
+  yandex-tracker-mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8788:8788"
+

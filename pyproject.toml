@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yandex-tracker-mcp"
+version = "0.1.0"
+description = "Independent MCP server for creating and managing Yandex Tracker issues"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28,<1",
+  "mcp[cli]>=1.27,<2",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+yandex-tracker-mcp = "yandex_tracker_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yandex_tracker_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
