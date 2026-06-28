@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
     # Support `python src/yandex_tracker_mcp/server.py` in addition to package entry points.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from yandex_tracker_mcp.config import Settings
+    from yandex_tracker_mcp.pipeline import PipelineError, PipelineRuntime
     from yandex_tracker_mcp.scheduler import SchedulerError, SchedulerRuntime
     from yandex_tracker_mcp.tracker import (
         CreateIssueCommand,
@@ -31,6 +32,7 @@ if __package__ in {None, ""}:
     )
 else:
     from .config import Settings
+    from .pipeline import PipelineError, PipelineRuntime
     from .scheduler import SchedulerError, SchedulerRuntime
     from .tracker import (
         CreateIssueCommand,
@@ -98,6 +100,39 @@ class ReportResult(BaseModel):
     delivery_error: str | None = None
 
 
+class PipelineSearchResult(BaseModel):
+    search_id: str
+    queue: str
+    query: str | None = None
+    max_issues: int
+    issues_found: int
+    filters: dict
+    issues: list[dict]
+    created_at: str
+
+
+class PipelineSummaryResult(BaseModel):
+    summary_id: str
+    search_id: str
+    title: str
+    focus: str | None = None
+    aggregates: dict
+    markdown: str
+    created_at: str
+
+
+class PipelineArtifactResult(BaseModel):
+    artifact_id: str
+    summary_id: str
+    filename: str
+    file_path: str
+    size_bytes: int
+    created_at: str
+    telegram_status: str
+    delivered_chats: int
+    delivery_error: str | None = None
+
+
 class StaticTokenVerifier(TokenVerifier):
     def __init__(self, expected_token: str) -> None:
         self._expected_token = expected_token
@@ -115,6 +150,7 @@ class StaticTokenVerifier(TokenVerifier):
 
 settings = Settings.from_env()
 _scheduler_runtime: SchedulerRuntime | None = None
+_pipeline_runtime: PipelineRuntime | None = None
 
 
 def _build_mcp() -> FastMCP:
@@ -150,17 +186,21 @@ def _http_app():
 
     @asynccontextmanager
     async def process_lifespan(starlette_app):
-        global _scheduler_runtime
-        logger.info("MCP application startup: initializing scheduler")
+        global _pipeline_runtime, _scheduler_runtime
+        logger.info("MCP application startup: initializing scheduler and composition pipeline")
         runtime = SchedulerRuntime(settings)
         await runtime.start()
         _scheduler_runtime = runtime
+        pipeline_runtime = PipelineRuntime(settings, gateway=runtime.gateway)
+        await pipeline_runtime.start()
+        _pipeline_runtime = pipeline_runtime
         logger.info("MCP application startup complete")
         try:
             async with session_manager_lifespan(starlette_app):
                 yield
         finally:
             logger.info("MCP application shutdown started")
+            _pipeline_runtime = None
             _scheduler_runtime = None
             await runtime.stop()
             logger.info("MCP application shutdown complete")
@@ -178,6 +218,12 @@ def _scheduler() -> SchedulerRuntime:
     if _scheduler_runtime is None:
         raise SchedulerError("Scheduler is not running yet.")
     return _scheduler_runtime
+
+
+def _pipeline() -> PipelineRuntime:
+    if _pipeline_runtime is None:
+        raise PipelineError("Composition pipeline is not running yet.")
+    return _pipeline_runtime
 
 
 def _required_text(value: str, name: str) -> str:
@@ -302,6 +348,121 @@ async def search_issues(
             )
         )
     return results
+
+
+@mcp.tool(
+    name="search_tracker_issues",
+    title="Pipeline step 1: search Tracker issues",
+    description=(
+        "First step of the report composition pipeline. Search Yandex Tracker, persist an exact "
+        "snapshot in SQLite, and return search_id. When the user also asks to summarize, save, "
+        "or send the result, pass this search_id to summarize_tracker_issues next. For common "
+        "requests such as open or critical issues, use open_only/critical_only and leave query "
+        "empty. Use query only when the user supplied an exact valid Yandex Tracker query."
+    ),
+)
+async def search_tracker_issues(
+    queue: Annotated[
+        str | None, Field(description="Queue key. Defaults to YANDEX_DEFAULT_QUEUE.")
+    ] = None,
+    query: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional exact Yandex Tracker query copied from the user. Do not generate a query "
+                "for open or critical filters; use the structured boolean parameters instead."
+            )
+        ),
+    ] = None,
+    open_only: Annotated[
+        bool,
+        Field(description="Return only non-closed issues when the user asks for open tasks."),
+    ] = False,
+    critical_only: Annotated[
+        bool,
+        Field(description="Return only critical or blocker priority issues."),
+    ] = False,
+    max_issues: Annotated[
+        int, Field(ge=1, le=100, description="Maximum issues stored in the search snapshot.")
+    ] = 100,
+) -> PipelineSearchResult:
+    """Persist the source dataset so later tools pass IDs instead of inventing data."""
+    result = await _pipeline().search(
+        queue=_required_text(queue or settings.default_queue or "", "queue"),
+        query=query.strip() if query else None,
+        max_issues=max_issues,
+        open_only=open_only,
+        critical_only=critical_only,
+    )
+    return PipelineSearchResult.model_validate(result)
+
+
+@mcp.tool(
+    name="summarize_tracker_issues",
+    title="Pipeline step 2: summarize Tracker issues",
+    description=(
+        "Second step of the report composition pipeline. Read the persisted snapshot identified "
+        "by search_id, calculate aggregates, and save a Markdown summary. Use only a real search_id "
+        "returned by search_tracker_issues. If the user asked to save or send the report, pass the "
+        "returned summary_id to save_tracker_report next."
+    ),
+)
+async def summarize_tracker_issues(
+    search_id: Annotated[
+        str,
+        Field(min_length=1, description="Exact search_id returned by search_tracker_issues."),
+    ],
+    focus: Annotated[
+        str | None,
+        Field(max_length=1000, description="Optional emphasis requested by the user."),
+    ] = None,
+    title: Annotated[
+        str | None, Field(max_length=200, description="Optional report title.")
+    ] = None,
+) -> PipelineSummaryResult:
+    result = await _pipeline().summarize(
+        search_id=_required_text(search_id, "search_id"),
+        focus=focus.strip() if focus else None,
+        title=title.strip() if title else None,
+    )
+    return PipelineSummaryResult.model_validate(result)
+
+
+@mcp.tool(
+    name="save_tracker_report",
+    title="Pipeline step 3: save and optionally send report",
+    description=(
+        "Final step of the report composition pipeline. Use only a real summary_id returned by "
+        "summarize_tracker_issues. Save the Markdown report to persistent storage and, when the "
+        "user explicitly asked to send it to Telegram, set send_to_telegram=true. Return the actual "
+        "file path and delivery status; never describe delivery as successful unless status is "
+        "delivered and delivered_chats is greater than zero."
+    ),
+)
+async def save_tracker_report(
+    summary_id: Annotated[
+        str,
+        Field(min_length=1, description="Exact summary_id returned by summarize_tracker_issues."),
+    ],
+    filename: Annotated[
+        str | None,
+        Field(max_length=120, description="Optional safe base filename; .md is added automatically."),
+    ] = None,
+    send_to_telegram: Annotated[
+        bool,
+        Field(description="Send the saved file to active Telegram subscribers when explicitly asked."),
+    ] = False,
+    format: Annotated[
+        Literal["markdown"], Field(description="Output format. Markdown is currently supported.")
+    ] = "markdown",
+) -> PipelineArtifactResult:
+    del format
+    result = await _pipeline().save_report(
+        summary_id=_required_text(summary_id, "summary_id"),
+        filename=filename.strip() if filename else None,
+        send_to_telegram=send_to_telegram,
+    )
+    return PipelineArtifactResult.model_validate(result)
 
 
 @mcp.tool(

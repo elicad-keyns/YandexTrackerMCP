@@ -35,6 +35,7 @@ class Settings:
     api_url: str
     scheduler_database: str
     scheduler_timezone: str
+    reports_directory: str
     bot_service_url: str | None
     bot_service_api_key: str | None
     mcp_api_key: str | None
@@ -57,6 +58,7 @@ class Settings:
             ).rstrip("/"),
             scheduler_database=_project_path("SCHEDULER_DATABASE", "data/scheduler.db"),
             scheduler_timezone=os.getenv("SCHEDULER_TIMEZONE", "Europe/Moscow").strip(),
+            reports_directory=_project_path("REPORTS_DIRECTORY", "data/reports"),
             bot_service_url=os.getenv("TELEGRAM_BOT_SERVICE_URL", "").strip().rstrip("/")
             or None,
             bot_service_api_key=os.getenv("TELEGRAM_BOT_SERVICE_API_KEY"),

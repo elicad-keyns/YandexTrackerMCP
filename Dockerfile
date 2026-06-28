@@ -8,9 +8,10 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/data/reports \
+    && chown -R appuser:appuser /app/data
 USER appuser
 
 EXPOSE 8788
 CMD ["yandex-tracker-mcp"]
-

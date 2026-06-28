@@ -10,6 +10,7 @@ from yandex_tracker_mcp.tracker import (
     UpdateIssueCommand,
     create_issue_payload,
     update_issue_payload,
+    _error_message,
 )
 
 
@@ -24,6 +25,7 @@ def settings(**overrides):
         "api_url": "https://api.tracker.yandex.net/v3",
         "scheduler_database": "data/test.db",
         "scheduler_timezone": "Europe/Moscow",
+        "reports_directory": "data/reports",
         "bot_service_url": None,
         "bot_service_api_key": None,
         "mcp_api_key": "mcp-secret",
@@ -101,6 +103,13 @@ def test_settings_reject_client_credentials_in_tracker_fields() -> None:
         settings(org_id="a" * 32).validate_for_startup()
     with pytest.raises(ValueError, match="real Tracker queue key"):
         settings(default_queue="YOURQUEUE").validate_for_startup()
+
+
+def test_tracker_error_message_handles_empty_error_messages() -> None:
+    assert _error_message({"errorMessages": [], "message": "Invalid query"}) == "Invalid query"
+    assert _error_message({"errorMessages": [], "errors": {"query": "Unknown value"}}) == (
+        '{"query": "Unknown value"}'
+    )
 
 
 @pytest.mark.asyncio

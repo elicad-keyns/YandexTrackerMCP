@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import time
 import uuid
@@ -206,11 +207,14 @@ class YandexTrackerGateway:
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         started = time.monotonic()
         logger.info(
-            "Yandex Tracker API request started: method=%s path=%s param_keys=%s body_keys=%s",
+            "Yandex Tracker API request started: method=%s path=%s param_keys=%s body_keys=%s "
+            "query=%r filter=%r",
             method,
             path,
             sorted((kwargs.get("params") or {}).keys()),
             sorted((kwargs.get("json") or {}).keys()),
+            str((kwargs.get("json") or {}).get("query") or "")[:500] or None,
+            (kwargs.get("json") or {}).get("filter"),
         )
         try:
             response = await self._client.request(
@@ -372,7 +376,27 @@ def _object_payload(payload: Any) -> dict[str, Any]:
 def _error_message(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
-    return payload.get("errorMessages", [None])[0] or payload.get("message") or payload.get("error")
+    error_messages = payload.get("errorMessages")
+    if isinstance(error_messages, list):
+        first_message = next(
+            (str(item).strip() for item in error_messages if str(item).strip()), None
+        )
+        if first_message:
+            return first_message
+    elif error_messages:
+        return str(error_messages)
+
+    for key in ("message", "error", "description"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+
+    errors = payload.get("errors")
+    if isinstance(errors, dict) and errors:
+        return json.dumps(errors, ensure_ascii=False)[:1000]
+    if isinstance(errors, list) and errors:
+        return json.dumps(errors, ensure_ascii=False)[:1000]
+    return None
 
 
 def _issue_result(issue: dict[str, Any], action: str, provider: str) -> dict[str, Any]:
