@@ -1,0 +1,26 @@
+services:
+  yandex-tracker-mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8788:8788"
+    volumes:
+      - tracker_mcp_data:/app/data
+    depends_on:
+      - telegram-bot
+
+  telegram-bot:
+    build:
+      context: ../YandexTrackerTelegramBot
+    restart: unless-stopped
+    env_file: ../YandexTrackerTelegramBot/.env
+    ports:
+      - "8791:8791"
+    volumes:
+      - telegram_bot_data:/app/data
+
+volumes:
+  tracker_mcp_data:
+  telegram_bot_data:
+

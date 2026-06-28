@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -9,6 +11,9 @@ from urllib.parse import quote
 import httpx
 
 from .config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class TrackerError(RuntimeError):
@@ -51,6 +56,10 @@ class TrackerGateway(Protocol):
     async def create_issue(self, command: CreateIssueCommand) -> dict[str, Any]: ...
 
     async def get_issue(self, issue_id: str) -> dict[str, Any]: ...
+
+    async def search_issues(
+        self, queue: str, query: str | None, max_results: int
+    ) -> list[dict[str, Any]]: ...
 
     async def update_issue(self, command: UpdateIssueCommand) -> dict[str, Any]: ...
 
@@ -139,6 +148,30 @@ class YandexTrackerGateway:
         result = await self._request("GET", f"/issues/{_path(issue_id)}")
         return _issue_result(_object_payload(result), "read", "yandex")
 
+    async def search_issues(
+        self, queue: str, query: str | None, max_results: int
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any]
+        if query:
+            payload = {"query": query}
+        else:
+            payload = {"filter": {"queue": queue}, "order": "-updatedAt"}
+        result = await self._request(
+            "POST",
+            "/issues/_search",
+            params={
+                "perPage": max_results,
+                "fields": (
+                    "id,key,summary,status,priority,assignee,deadline,dueDate,"
+                    "updatedAt,createdAt,queue,tags"
+                ),
+            },
+            json=payload,
+        )
+        if not isinstance(result, list):
+            raise TrackerError("Yandex Tracker returned an unexpected search response.")
+        return [item for item in result if isinstance(item, dict)][:max_results]
+
     async def update_issue(self, command: UpdateIssueCommand) -> dict[str, Any]:
         payload, params = update_issue_payload(command)
         result = await self._request(
@@ -171,21 +204,63 @@ class YandexTrackerGateway:
         return _issue_result(_object_payload(result), "cancelled", "yandex")
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        started = time.monotonic()
+        logger.info(
+            "Yandex Tracker API request started: method=%s path=%s param_keys=%s body_keys=%s",
+            method,
+            path,
+            sorted((kwargs.get("params") or {}).keys()),
+            sorted((kwargs.get("json") or {}).keys()),
+        )
         try:
             response = await self._client.request(
                 method, f"{self._settings.api_url}{path}", headers=self._headers, **kwargs
             )
         except httpx.HTTPError as error:
+            logger.exception(
+                "Yandex Tracker API transport failed: method=%s path=%s duration_ms=%d",
+                method,
+                path,
+                int((time.monotonic() - started) * 1000),
+            )
             raise TrackerError(f"Yandex Tracker request failed: {error}") from error
         try:
             payload = response.json()
         except ValueError as error:
+            logger.error(
+                "Yandex Tracker returned invalid JSON: method=%s path=%s http_status=%d "
+                "duration_ms=%d response=%r",
+                method,
+                path,
+                response.status_code,
+                int((time.monotonic() - started) * 1000),
+                response.text[:1000],
+            )
             raise TrackerError(
                 f"Yandex Tracker returned HTTP {response.status_code} with invalid JSON."
             ) from error
         if response.is_error:
             message = _error_message(payload) or response.reason_phrase
+            logger.error(
+                "Yandex Tracker API error: method=%s path=%s http_status=%d duration_ms=%d "
+                "message=%s",
+                method,
+                path,
+                response.status_code,
+                int((time.monotonic() - started) * 1000),
+                message,
+            )
             raise TrackerError(f"Yandex Tracker API error {response.status_code}: {message}")
+        result_count = len(payload) if isinstance(payload, list) else None
+        logger.info(
+            "Yandex Tracker API request succeeded: method=%s path=%s http_status=%d "
+            "duration_ms=%d result_count=%s",
+            method,
+            path,
+            response.status_code,
+            int((time.monotonic() - started) * 1000),
+            result_count,
+        )
         return payload
 
 
@@ -218,6 +293,17 @@ class MockTrackerGateway:
 
     async def get_issue(self, issue_id: str) -> dict[str, Any]:
         return _issue_result(self._find(issue_id), "read", "mock")
+
+    async def search_issues(
+        self, queue: str, query: str | None, max_results: int
+    ) -> list[dict[str, Any]]:
+        del query
+        prefix = f"{queue.upper()}-"
+        return [
+            copy.deepcopy(issue)
+            for issue in self._issues.values()
+            if issue["key"].upper().startswith(prefix)
+        ][:max_results]
 
     async def update_issue(self, command: UpdateIssueCommand) -> dict[str, Any]:
         payload, _ = update_issue_payload(command)
@@ -314,4 +400,3 @@ def _transition_result(transition: dict[str, Any]) -> dict[str, Any]:
         "to_status_key": target.get("key"),
         "to_status_display": target.get("display"),
     }
-

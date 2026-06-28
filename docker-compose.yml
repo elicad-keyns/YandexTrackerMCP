@@ -5,4 +5,8 @@ services:
     env_file: .env
     ports:
       - "8788:8788"
+    volumes:
+      - tracker_mcp_data:/app/data
 
+volumes:
+  tracker_mcp_data:

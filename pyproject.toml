@@ -9,6 +9,7 @@ description = "Independent MCP server for creating and managing Yandex Tracker i
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "APScheduler>=3.11,<4",
   "httpx>=0.28,<1",
   "mcp[cli]>=1.27,<2",
   "pydantic>=2.11,<3",

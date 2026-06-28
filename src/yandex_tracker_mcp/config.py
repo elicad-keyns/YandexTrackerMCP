@@ -19,6 +19,11 @@ def _boolean(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _project_path(name: str, default: str) -> str:
+    value = Path(os.getenv(name, default))
+    return str(value if value.is_absolute() else PROJECT_ROOT / value)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     backend: str
@@ -28,6 +33,10 @@ class Settings:
     org_header: str
     default_queue: str | None
     api_url: str
+    scheduler_database: str
+    scheduler_timezone: str
+    bot_service_url: str | None
+    bot_service_api_key: str | None
     mcp_api_key: str | None
     allow_insecure_no_auth: bool
     mcp_host: str
@@ -46,6 +55,11 @@ class Settings:
             api_url=os.getenv(
                 "YANDEX_TRACKER_API_URL", "https://api.tracker.yandex.net/v3"
             ).rstrip("/"),
+            scheduler_database=_project_path("SCHEDULER_DATABASE", "data/scheduler.db"),
+            scheduler_timezone=os.getenv("SCHEDULER_TIMEZONE", "Europe/Moscow").strip(),
+            bot_service_url=os.getenv("TELEGRAM_BOT_SERVICE_URL", "").strip().rstrip("/")
+            or None,
+            bot_service_api_key=os.getenv("TELEGRAM_BOT_SERVICE_API_KEY"),
             mcp_api_key=os.getenv("MCP_API_KEY"),
             allow_insecure_no_auth=_boolean("ALLOW_INSECURE_NO_AUTH"),
             mcp_host=os.getenv("MCP_HOST", "0.0.0.0").strip(),
@@ -64,6 +78,10 @@ class Settings:
         if not self.mcp_api_key and not self.allow_insecure_no_auth:
             raise ValueError(
                 "MCP_API_KEY is required. Set ALLOW_INSECURE_NO_AUTH=true only for local tests."
+            )
+        if self.bot_service_url and not self.bot_service_api_key:
+            raise ValueError(
+                "TELEGRAM_BOT_SERVICE_API_KEY is required when TELEGRAM_BOT_SERVICE_URL is set."
             )
         if self.backend == "mock":
             return

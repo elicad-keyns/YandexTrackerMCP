@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hmac
+import logging
+import os
 import sys
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -11,10 +14,14 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl, BaseModel, Field
 
+
+logger = logging.getLogger(__name__)
+
 if __package__ in {None, ""}:
     # Support `python src/yandex_tracker_mcp/server.py` in addition to package entry points.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from yandex_tracker_mcp.config import Settings
+    from yandex_tracker_mcp.scheduler import SchedulerError, SchedulerRuntime
     from yandex_tracker_mcp.tracker import (
         CreateIssueCommand,
         TrackerError,
@@ -24,6 +31,7 @@ if __package__ in {None, ""}:
     )
 else:
     from .config import Settings
+    from .scheduler import SchedulerError, SchedulerRuntime
     from .tracker import (
         CreateIssueCommand,
         TrackerError,
@@ -52,6 +60,44 @@ class TransitionResult(BaseModel):
     to_status_display: str | None = None
 
 
+class IssueListItem(BaseModel):
+    key: str
+    summary: str
+    status: str | None = None
+    priority: str | None = None
+    assignee: str | None = None
+    deadline: str | None = None
+    url: str
+
+
+class ScheduledJobResult(BaseModel):
+    id: str
+    name: str
+    queue: str
+    schedule_type: Literal["once", "interval", "cron"]
+    schedule_value: str
+    timezone: str
+    query: str | None = None
+    max_issues: int
+    enabled: bool
+    deleted: bool
+    created_at: str
+    updated_at: str
+    next_run_at: str | None = None
+
+
+class ReportResult(BaseModel):
+    id: str
+    job_id: str
+    title: str
+    body: str
+    aggregates: dict
+    generated_at: str
+    delivery_status: str
+    delivered_chats: int = 0
+    delivery_error: str | None = None
+
+
 class StaticTokenVerifier(TokenVerifier):
     def __init__(self, expected_token: str) -> None:
         self._expected_token = expected_token
@@ -68,6 +114,7 @@ class StaticTokenVerifier(TokenVerifier):
 
 
 settings = Settings.from_env()
+_scheduler_runtime: SchedulerRuntime | None = None
 
 
 def _build_mcp() -> FastMCP:
@@ -97,9 +144,40 @@ def _build_mcp() -> FastMCP:
 mcp = _build_mcp()
 
 
+def _http_app():
+    app = mcp.streamable_http_app()
+    session_manager_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def process_lifespan(starlette_app):
+        global _scheduler_runtime
+        logger.info("MCP application startup: initializing scheduler")
+        runtime = SchedulerRuntime(settings)
+        await runtime.start()
+        _scheduler_runtime = runtime
+        logger.info("MCP application startup complete")
+        try:
+            async with session_manager_lifespan(starlette_app):
+                yield
+        finally:
+            logger.info("MCP application shutdown started")
+            _scheduler_runtime = None
+            await runtime.stop()
+            logger.info("MCP application shutdown complete")
+
+    app.router.lifespan_context = process_lifespan
+    return app
+
+
 @lru_cache(maxsize=1)
 def _gateway() -> TrackerGateway:
     return create_gateway(settings)
+
+
+def _scheduler() -> SchedulerRuntime:
+    if _scheduler_runtime is None:
+        raise SchedulerError("Scheduler is not running yet.")
+    return _scheduler_runtime
 
 
 def _required_text(value: str, name: str) -> str:
@@ -180,6 +258,50 @@ async def get_issue(
     issue_id: Annotated[str, Field(min_length=1, description="Issue key or ID, e.g. TEST-42.")],
 ) -> IssueResult:
     return IssueResult.model_validate(await _gateway().get_issue(_required_text(issue_id, "issue_id")))
+
+
+@mcp.tool(
+    name="search_issues",
+    title="Search Yandex Tracker issues",
+    description=(
+        "Find issues for Telegram commands or an agent report. Use either a queue or a full "
+        "Yandex Tracker query and return a compact list."
+    ),
+)
+async def search_issues(
+    queue: Annotated[
+        str | None, Field(description="Queue key. Defaults to YANDEX_DEFAULT_QUEUE.")
+    ] = None,
+    query: Annotated[
+        str | None,
+        Field(description="Optional full Yandex Tracker query language expression."),
+    ] = None,
+    max_results: Annotated[
+        int, Field(ge=1, le=100, description="Maximum number of issues to return.")
+    ] = 20,
+) -> list[IssueListItem]:
+    target_queue = _required_text(queue or settings.default_queue or "", "queue")
+    issues = await _gateway().search_issues(
+        target_queue, query.strip() if query else None, max_results
+    )
+    results = []
+    for issue in issues:
+        key = str(issue.get("key") or "")
+        status = issue.get("status") if isinstance(issue.get("status"), dict) else {}
+        priority = issue.get("priority") if isinstance(issue.get("priority"), dict) else {}
+        assignee = issue.get("assignee") if isinstance(issue.get("assignee"), dict) else {}
+        results.append(
+            IssueListItem(
+                key=key,
+                summary=str(issue.get("summary") or ""),
+                status=status.get("display") or status.get("key"),
+                priority=priority.get("display") or priority.get("key"),
+                assignee=assignee.get("display") or assignee.get("id"),
+                deadline=issue.get("deadline") or issue.get("dueDate"),
+                url=f"https://tracker.yandex.ru/{key}",
+            )
+        )
+    return results
 
 
 @mcp.tool(
@@ -278,9 +400,195 @@ async def cancel_issue(
     return IssueResult.model_validate(result)
 
 
+@mcp.tool(
+    name="schedule_tracker_report",
+    title="Schedule periodic Yandex Tracker report",
+    description=(
+        "Create a persisted once, interval, or cron report job. The scheduler stores jobs, runs, "
+        "and aggregate reports in SQLite and sends completed reports to the Telegram bot service."
+    ),
+)
+async def schedule_tracker_report(
+    name: Annotated[str, Field(min_length=1, max_length=200, description="Schedule name.")],
+    schedule_type: Annotated[
+        Literal["once", "interval", "cron"],
+        Field(description="Run once, every N minutes, or by five-field cron expression."),
+    ],
+    confirmed: Annotated[
+        bool, Field(description="Must be true after the user confirmed the schedule details.")
+    ],
+    queue: Annotated[
+        str | None, Field(description="Tracker queue key. Defaults to YANDEX_DEFAULT_QUEUE.")
+    ] = None,
+    run_at: Annotated[
+        str | None, Field(description="ISO 8601 datetime required for schedule_type=once.")
+    ] = None,
+    interval_minutes: Annotated[
+        int | None, Field(ge=1, le=525600, description="Minutes for schedule_type=interval.")
+    ] = None,
+    cron_expression: Annotated[
+        str | None,
+        Field(description="Five-field cron, e.g. '0 9 * * 1-5', for schedule_type=cron."),
+    ] = None,
+    timezone: Annotated[
+        str | None, Field(description="IANA timezone. Defaults to SCHEDULER_TIMEZONE.")
+    ] = None,
+    query: Annotated[
+        str | None, Field(description="Optional full Tracker query used instead of queue filter.")
+    ] = None,
+    max_issues: Annotated[
+        int, Field(ge=1, le=100, description="Maximum issues aggregated per report.")
+    ] = 100,
+) -> ScheduledJobResult:
+    if not confirmed:
+        raise SchedulerError("The schedule was not created because confirmed must be true.")
+    values = {
+        "once": run_at,
+        "interval": str(interval_minutes) if interval_minutes is not None else None,
+        "cron": cron_expression,
+    }
+    schedule_value = values[schedule_type]
+    if not schedule_value:
+        raise SchedulerError(f"A schedule value is required for schedule_type={schedule_type}.")
+    result = await _scheduler().create_job(
+        name=_required_text(name, "name"),
+        queue=_required_text(queue or settings.default_queue or "", "queue"),
+        schedule_type=schedule_type,
+        schedule_value=schedule_value.strip(),
+        timezone_name=(timezone or settings.scheduler_timezone).strip(),
+        query=query.strip() if query else None,
+        max_issues=max_issues,
+    )
+    return ScheduledJobResult.model_validate(result)
+
+
+@mcp.tool(
+    name="list_scheduled_reports",
+    title="List scheduled Tracker reports",
+    description="List persisted report schedules with their next run time and enabled state.",
+)
+async def list_scheduled_reports() -> list[ScheduledJobResult]:
+    return [ScheduledJobResult.model_validate(job) for job in await _scheduler().list_jobs()]
+
+
+@mcp.tool(
+    name="pause_scheduled_report",
+    title="Pause scheduled Tracker report",
+    description="Pause a report schedule without deleting its report history.",
+)
+async def pause_scheduled_report(
+    job_id: Annotated[str, Field(min_length=1, description="Scheduled job ID.")],
+    confirmed: Annotated[bool, Field(description="Must be true after user confirmation.")],
+) -> ScheduledJobResult:
+    if not confirmed:
+        raise SchedulerError("The schedule was not paused because confirmed must be true.")
+    return ScheduledJobResult.model_validate(
+        await _scheduler().pause_job(_required_text(job_id, "job_id"))
+    )
+
+
+@mcp.tool(
+    name="resume_scheduled_report",
+    title="Resume scheduled Tracker report",
+    description="Resume a paused report schedule.",
+)
+async def resume_scheduled_report(
+    job_id: Annotated[str, Field(min_length=1, description="Scheduled job ID.")],
+    confirmed: Annotated[bool, Field(description="Must be true after user confirmation.")],
+) -> ScheduledJobResult:
+    if not confirmed:
+        raise SchedulerError("The schedule was not resumed because confirmed must be true.")
+    return ScheduledJobResult.model_validate(
+        await _scheduler().resume_job(_required_text(job_id, "job_id"))
+    )
+
+
+@mcp.tool(
+    name="delete_scheduled_report",
+    title="Delete scheduled Tracker report",
+    description="Delete a schedule while preserving its previously generated reports in SQLite.",
+)
+async def delete_scheduled_report(
+    job_id: Annotated[str, Field(min_length=1, description="Scheduled job ID.")],
+    confirmed: Annotated[bool, Field(description="Must be true after user confirmation.")],
+) -> ScheduledJobResult:
+    if not confirmed:
+        raise SchedulerError("The schedule was not deleted because confirmed must be true.")
+    return ScheduledJobResult.model_validate(
+        await _scheduler().delete_job(_required_text(job_id, "job_id"))
+    )
+
+
+@mcp.tool(
+    name="run_scheduled_report_now",
+    title="Run Tracker report now",
+    description="Run a persisted report job immediately, save it, and deliver it to Telegram.",
+)
+async def run_scheduled_report_now(
+    job_id: Annotated[str, Field(min_length=1, description="Scheduled job ID.")],
+    confirmed: Annotated[bool, Field(description="Must be true after user confirmation.")],
+) -> ReportResult:
+    if not confirmed:
+        raise SchedulerError("The report was not run because confirmed must be true.")
+    return ReportResult.model_validate(
+        await _scheduler().run_job(_required_text(job_id, "job_id"))
+    )
+
+
+@mcp.tool(
+    name="get_latest_tracker_report",
+    title="Get latest Tracker report",
+    description="Return the most recent persisted aggregate report, optionally for one job.",
+)
+async def get_latest_tracker_report(
+    job_id: Annotated[str | None, Field(description="Optional scheduled job ID.")] = None,
+) -> ReportResult:
+    report = await _scheduler().latest_report(job_id.strip() if job_id else None)
+    if report is None:
+        raise SchedulerError("No generated reports were found.")
+    return ReportResult.model_validate(report)
+
+
+@mcp.tool(
+    name="get_tracker_report_history",
+    title="Get Tracker report history",
+    description="Return recent reports persisted in SQLite.",
+)
+async def get_tracker_report_history(
+    limit: Annotated[int, Field(ge=1, le=100, description="Maximum reports to return.")] = 20,
+) -> list[ReportResult]:
+    return [
+        ReportResult.model_validate(report)
+        for report in await _scheduler().report_history(limit)
+    ]
+
+
 def main() -> None:
+    import uvicorn
+
     settings.validate_for_startup()
-    mcp.run(transport="streamable-http")
+    log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("yandex_tracker_mcp").setLevel(log_level)
+    logger.info(
+        "Starting Yandex Tracker MCP: host=%s port=%d public_url=%s backend=%s "
+        "scheduler_timezone=%s bot_service_url=%s",
+        settings.mcp_host,
+        settings.mcp_port,
+        settings.mcp_public_url,
+        settings.backend,
+        settings.scheduler_timezone,
+        settings.bot_service_url or "not configured",
+    )
+    uvicorn.run(
+        _http_app(),
+        host=settings.mcp_host,
+        port=settings.mcp_port,
+        log_level=log_level.lower(),
+    )
 
 
 if __name__ == "__main__":
