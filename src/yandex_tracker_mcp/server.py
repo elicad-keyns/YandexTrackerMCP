@@ -133,6 +133,15 @@ class PipelineArtifactResult(BaseModel):
     delivery_error: str | None = None
 
 
+class PipelineArtifactContentResult(BaseModel):
+    artifact_id: str
+    summary_id: str
+    filename: str
+    markdown: str
+    size_bytes: int
+    created_at: str
+
+
 class StaticTokenVerifier(TokenVerifier):
     def __init__(self, expected_token: str) -> None:
         self._expected_token = expected_token
@@ -433,10 +442,10 @@ async def summarize_tracker_issues(
     title="Pipeline step 3: save and optionally send report",
     description=(
         "Final step of the report composition pipeline. Use only a real summary_id returned by "
-        "summarize_tracker_issues. Save the Markdown report to persistent storage and, when the "
-        "user explicitly asked to send it to Telegram, set send_to_telegram=true. Return the actual "
-        "file path and delivery status; never describe delivery as successful unless status is "
-        "delivered and delivered_chats is greater than zero."
+        "summarize_tracker_issues. Save the Markdown report to persistent storage and return its "
+        "artifact_id. When the user also asked to send the file to Telegram, this is not the final "
+        "step: pass artifact_id to send_tracker_artifact on the separate Telegram Delivery MCP "
+        "server. Saving a file never proves Telegram delivery."
     ),
 )
 async def save_tracker_report(
@@ -448,10 +457,6 @@ async def save_tracker_report(
         str | None,
         Field(max_length=120, description="Optional safe base filename; .md is added automatically."),
     ] = None,
-    send_to_telegram: Annotated[
-        bool,
-        Field(description="Send the saved file to active Telegram subscribers when explicitly asked."),
-    ] = False,
     format: Annotated[
         Literal["markdown"], Field(description="Output format. Markdown is currently supported.")
     ] = "markdown",
@@ -460,9 +465,27 @@ async def save_tracker_report(
     result = await _pipeline().save_report(
         summary_id=_required_text(summary_id, "summary_id"),
         filename=filename.strip() if filename else None,
-        send_to_telegram=send_to_telegram,
+        send_to_telegram=False,
     )
     return PipelineArtifactResult.model_validate(result)
+
+
+@mcp.tool(
+    name="get_report_artifact",
+    title="Read saved Tracker report artifact",
+    description=(
+        "Read one previously saved Markdown report by exact artifact_id. This is primarily used "
+        "server-to-server by Telegram Delivery MCP. Do not call it before save_tracker_report and "
+        "never invent artifact_id."
+    ),
+)
+async def get_report_artifact(
+    artifact_id: Annotated[
+        str, Field(min_length=1, description="Exact artifact_id returned by save_tracker_report.")
+    ],
+) -> PipelineArtifactContentResult:
+    result = await _pipeline().get_artifact(_required_text(artifact_id, "artifact_id"))
+    return PipelineArtifactContentResult.model_validate(result)
 
 
 @mcp.tool(

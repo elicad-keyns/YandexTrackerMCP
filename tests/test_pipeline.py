@@ -79,6 +79,7 @@ async def test_composition_pipeline_passes_ids_and_saves_document(tmp_path) -> N
         filename="day-19-report",
         send_to_telegram=True,
     )
+    loaded_artifact = await runtime.get_artifact(artifact["artifact_id"])
 
     assert search["issues_found"] == 1
     assert search["query"] is None
@@ -100,6 +101,9 @@ async def test_composition_pipeline_passes_ids_and_saves_document(tmp_path) -> N
     assert report_path.exists()
     assert "TEST-1" in report_path.read_text(encoding="utf-8")
     assert notifier.documents[0]["content"] == report_path.read_bytes()
+    assert loaded_artifact["artifact_id"] == artifact["artifact_id"]
+    assert loaded_artifact["summary_id"] == summary["summary_id"]
+    assert loaded_artifact["markdown"] == report_path.read_text(encoding="utf-8")
 
 
 def test_summary_is_built_from_persisted_search_snapshot() -> None:

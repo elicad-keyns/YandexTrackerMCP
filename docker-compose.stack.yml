@@ -20,7 +20,20 @@ services:
     volumes:
       - telegram_bot_data:/app/data
 
+  telegram-delivery-mcp:
+    build:
+      context: ../YandexTrackerTelegramMCP
+    restart: unless-stopped
+    env_file: ../YandexTrackerTelegramMCP/.env
+    ports:
+      - "8792:8792"
+    volumes:
+      - telegram_delivery_mcp_data:/app/data
+    depends_on:
+      - yandex-tracker-mcp
+      - telegram-bot
+
 volumes:
   tracker_mcp_data:
   telegram_bot_data:
-
+  telegram_delivery_mcp_data:

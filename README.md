@@ -201,6 +201,19 @@ SQLite, что и расписания. Файлы сохраняются в `da
 REPORTS_DIRECTORY=data/reports
 ```
 
+## День 20: передача артефакта другому MCP-серверу
+
+Для multi-server orchestration `save_tracker_report` только сохраняет Markdown и
+возвращает `artifact_id`. Отправка больше не маскируется под сохранение: агент должен
+переключиться на отдельный `Telegram Delivery MCP` и вызвать `send_tracker_artifact`.
+
+Инструмент `get_report_artifact` безопасно читает сохранённый файл по точному
+`artifact_id`. Он проверяет, что путь находится внутри `REPORTS_DIRECTORY`, ограничивает
+размер 10 МБ и используется Telegram Delivery MCP как внутренний MCP-клиент.
+
+Фоновый APScheduler от ChatbotAI не зависит и продолжает использовать внутренний
+bot-service напрямую. Поэтому расписания работают при выключенном desktop-клиенте.
+
 ## Проверки
 
 ```bash

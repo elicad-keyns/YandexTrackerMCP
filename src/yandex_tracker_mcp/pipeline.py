@@ -180,6 +180,17 @@ class PipelineStore:
                 ),
             )
 
+    def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT * FROM report_artifacts WHERE id = ?", (artifact_id,)
+            ).fetchone()
+        if row is None:
+            raise PipelineError(f"Report artifact '{artifact_id}' was not found.")
+        result = dict(row)
+        result["artifact_id"] = result.pop("id")
+        return result
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
@@ -398,6 +409,36 @@ class PipelineRuntime:
             delivery.error,
         )
         return artifact
+
+    async def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+        artifact = self.store.get_artifact(artifact_id)
+        file_path = Path(artifact["file_path"]).resolve()
+        reports_root = self.reports_directory.resolve()
+        if not file_path.is_relative_to(reports_root):
+            raise PipelineError("Stored artifact path is outside REPORTS_DIRECTORY.")
+        if not file_path.is_file():
+            raise PipelineError(f"Report artifact file '{artifact_id}' is missing.")
+        content = file_path.read_bytes()
+        if len(content) > 10_000_000:
+            raise PipelineError("Report artifact exceeds the 10 MB delivery limit.")
+        try:
+            markdown = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise PipelineError("Report artifact is not valid UTF-8 Markdown.") from error
+        logger.info(
+            "Pipeline artifact loaded: artifact_id=%s filename=%s size_bytes=%d",
+            artifact_id,
+            artifact["filename"],
+            len(content),
+        )
+        return {
+            "artifact_id": artifact_id,
+            "summary_id": artifact["summary_id"],
+            "filename": artifact["filename"],
+            "markdown": markdown,
+            "size_bytes": len(content),
+            "created_at": artifact["created_at"],
+        }
 
 
 def build_tracker_summary(
